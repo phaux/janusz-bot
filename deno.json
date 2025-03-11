@@ -1,0 +1,10 @@
+{
+  "imports": {
+    "@smol/gram": "jsr:@smol/gram@^2.10.0",
+    "ollama": "npm:ollama@^0.5.14"
+  },
+  "fmt": {
+    "lineWidth": 100
+  },
+  "lock": false
+}
