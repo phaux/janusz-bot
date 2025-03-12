@@ -1,4 +1,4 @@
-import { Message } from "ollama";
+import { ChatResponse, Message } from "ollama";
 import { bot } from "./bot.ts";
 import ollama from "ollama";
 
@@ -23,6 +23,7 @@ export async function generateResponse(
   }
 
   if (replyToMessageId != null) {
+    // React to currently handled message.
     await bot
       .setMessageReaction({
         chat_id: chatId,
@@ -32,8 +33,6 @@ export async function generateResponse(
       .catch(() => {});
   }
 
-  let responseText = "";
-  let i = 0;
   let lastMessageId = replyToMessageId;
 
   try {
@@ -43,41 +42,26 @@ export async function generateResponse(
       messages: [initialMessage, ...chatMessages],
       stream: true,
     });
-
-    for await (const chunk of stream) {
-      if (chunk.message.role === "assistant") {
-        responseText += chunk.message.content;
+    for await (const responseText of getAssistantMessages(stream)) {
+      if (!responseText) {
+        // Turn empty messages into typing actions.
+        await bot.sendChatAction({ chat_id: chatId, action: "typing" }).catch(() => {});
+        continue;
       }
-
-      const newLineIdx = responseText.indexOf("\n");
-      if (newLineIdx !== -1) {
-        const newMessageText = responseText.substring(0, newLineIdx);
-        if (newMessageText.trim().length > 0) {
-          console.log("assistant", ":", newMessageText);
-          const newMessage = await bot.sendMessage({
-            chat_id: chatId,
-            reply_parameters: lastMessageId != null ? { message_id: lastMessageId } : undefined,
-            text: responseText.substring(0, newLineIdx),
-          });
-          lastMessageId = newMessage.message_id;
-          i = 0;
-        }
-        responseText = responseText.substring(newLineIdx + 1);
-      }
-
-      if (i % 10 === 0) {
-        await bot
-          .sendChatAction({
-            chat_id: chatId,
-            action: "typing",
-          })
-          .catch(() => {});
-      }
-
-      i += 1;
+      console.log("assistant", ":", responseText);
+      const newMessage = await bot.sendMessage({
+        chat_id: chatId,
+        reply_parameters: lastMessageId != null ? { message_id: lastMessageId } : undefined,
+        text: responseText
+          // Telegram API requires escaping of some characters in MarkdownV2 mode.
+          .replace(/[-!#.()]/g, (s) => `\\${s}`),
+        parse_mode: "MarkdownV2",
+      });
+      lastMessageId = newMessage.message_id;
     }
   } finally {
     if (replyToMessageId) {
+      // Remove reaction from currently handled message.
       await bot
         .setMessageReaction({
           chat_id: chatId,
@@ -87,11 +71,72 @@ export async function generateResponse(
         .catch(() => {});
     }
   }
+}
 
-  console.log("assistant", ":", responseText);
-  await bot.sendMessage({
-    chat_id: chatId,
-    reply_parameters: lastMessageId ? { message_id: lastMessageId } : undefined,
-    text: responseText,
-  });
+/**
+ * Takes Ollama response stream and turns it into an iterable of paragraphs to send as messages.
+ * Also yields null every short interval so you can send typing indicators.
+ */
+const getAssistantMessages = (responseStream: AsyncIterable<ChatResponse>) =>
+  intersperseNulls(splitParagraphs(getAssistantText(responseStream)), 3000);
+
+/** Takes Ollama response stream and returns iterable of response text chunks. */
+async function* getAssistantText(responseStream: AsyncIterable<ChatResponse>) {
+  for await (const chunk of responseStream) {
+    if (chunk.message.role === "assistant") {
+      yield chunk.message.content;
+    }
+  }
+}
+
+/** Takes iterable of string chunks and returns iterable of markdown paragraphs. */
+async function* splitParagraphs(strings: AsyncIterable<string>) {
+  let buffer: string[] = [];
+  let insideCode = false;
+  for await (const line of splitLines(strings)) {
+    if (line.startsWith("```")) {
+      insideCode = !insideCode;
+    }
+    if (line.trim().length === 0 && !insideCode) {
+      if (buffer.length > 0) {
+        yield buffer.join("\n");
+        buffer = [];
+      }
+    } else {
+      buffer.push(line);
+    }
+  }
+  yield buffer.join("\n");
+}
+
+/** Takes iterable of string chunks and returns iterable of lines. */
+async function* splitLines(strings: AsyncIterable<string>) {
+  let buffer = "";
+  for await (const str of strings) {
+    buffer += str;
+    const lines = buffer.split("\n");
+    buffer = lines.pop() ?? "";
+    for (const line of lines) {
+      yield line;
+    }
+  }
+  yield buffer;
+}
+
+/** Adds null values to async iterable every `delay` milliseconds. */
+async function* intersperseNulls<T>(iterable: AsyncIterable<T>, delay: number) {
+  const iterator = iterable[Symbol.asyncIterator]();
+  let nextPromise = iterator.next();
+  while (true) {
+    yield null;
+    const result = await Promise.race([
+      nextPromise,
+      new Promise<undefined>((resolve) => setTimeout(resolve, delay)),
+    ]);
+    if (result != null) {
+      if (result.done) break;
+      yield result.value;
+      nextPromise = iterator.next();
+    }
+  }
 }
